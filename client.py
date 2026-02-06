@@ -6,12 +6,26 @@ import socket
 import argparse
 import struct
 import os
+import hashlib
 
-# CONST CHUNK SIZE: 4092 BYTES
-# NOTE (4096 - 4 BYTE SEQ HEADER) SO PACKETS FIT RELAY BUFFER
-CHUNK_SIZE = 4092
+# CONST CHUNK SIZE: 4090 BYTES
+# NOTE (4096 - 4 BYTE SEQ HEADER - 2 BYTE CHECKSUM) SO PACKETS FIT RELAY BUFFER
+CHUNK_SIZE = 4090
 MAX_RETRIES = 50
 TIMEOUT = 1.0
+
+def compute_checksum(data):
+    # MAKE A 16-BIT INTERNET CHECKSUM (RFC 1071)
+    if len(data) % 2 == 1:
+        data += b'\x00'
+    total = 0
+    for i in range(0, len(data), 2):
+        word = (data[i] << 8) + data[i + 1]
+        total += word
+    while total >> 16:
+        total = (total & 0xFFFF) + (total >> 16)
+    return ~total & 0xFFFF
+
 
 def run_client(target_ip, target_port, input_file):
     # CREATE UDP SOCKET
@@ -38,8 +52,9 @@ def run_client(target_ip, target_port, input_file):
                 if not chunk:
                     break
 
-                # BUILD PACKET: 4-BYTE SEQ HEADER + DATA
-                packet = struct.pack('!I', seq_num) + chunk
+                # BUILD PACKET: 4-BYTE SEQ HEADER + 2-BYTE CHECKSUM + DATA
+                checksum = compute_checksum(chunk)
+                packet = struct.pack('!IH', seq_num, checksum) + chunk
 
                 # STOP-AND-WAIT: SEND AND WAIT FOR ACK
                 retries = 0
@@ -62,8 +77,12 @@ def run_client(target_ip, target_port, input_file):
                     return
 
 
-        # SEND EOF SIGNAL (EMPTY PACKET WITH SEQ HEADER)
-        eof_packet = struct.pack('!I', seq_num)
+        # COMPUTE FINAL MD5 CHECKSUM OF THE FILE
+        file_md5 = hashlib.md5(open(input_file, 'rb').read()).hexdigest()
+        print(f"[*] FINAL CHECK - FILE MD5[{file_md5}]")
+
+        # SEND EOF SIGNAL: SEQ HEADER + 'EOF' MARKER + MD5 HEX DIGEST
+        eof_packet = struct.pack('!I', seq_num) + b'EOF' + file_md5.encode('utf-8')
         retries = 0
         while retries < MAX_RETRIES:
             cli_socket.sendto(eof_packet, server_address)

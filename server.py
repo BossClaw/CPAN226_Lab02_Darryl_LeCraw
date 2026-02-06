@@ -6,6 +6,20 @@ import socket
 import argparse
 import struct
 import os
+import hashlib
+
+def compute_checksum(data):
+     # MAKE A 16-BIT INTERNET CHECKSUM (RFC 1071)
+    if len(data) % 2 == 1:
+        data += b'\x00'
+    total = 0
+    for i in range(0, len(data), 2):
+        word = (data[i] << 8) + data[i + 1]
+        total += word
+    while total >> 16:
+        total = (total & 0xFFFF) + (total >> 16)
+    return ~total & 0xFFFF
+
 
 def run_server(port, output_file):
     # CREATE UDP SOCKET
@@ -24,16 +38,24 @@ def run_server(port, output_file):
             sender_filename = None
             expected_seq = 0
             buffer = {}
+            checksum_pass = 0
+            checksum_fail = 0
 
             while True:
                 data, addr = serv_sock.recvfrom(4096)
 
-                # CHECK FOR EOF: PACKET WITH ONLY 4-BYTE HEADER (NO PAYLOAD)
-                if len(data) <= 4:
-                    # SEND EOF ACK
-                    eof_seq = struct.unpack('!I', data[:4])[0] if len(data) == 4 else expected_seq
+                # CHECK FOR EOF: PACKET WITH 'EOF' MARKER AFTER SEQ HEADER
+                # FORMAT: [4B SEQ][3B 'EOF'][32B MD5 HEX] = 39 BYTES
+                if len(data) >= 7 and data[4:7] == b'EOF':
+                    eof_seq = struct.unpack('!I', data[:4])[0]
                     serv_sock.sendto(struct.pack('!I', eof_seq), addr)
                     print(f"[*] CLOSING AFTER END OF FILE SIGNAL RECEIVED FROM ADDR[{addr}]")
+
+                    # EXTRACT CLIENT MD5 FROM EOF PACKET
+                    if len(data) >= 39:
+                        client_md5 = data[7:39].decode('utf-8')
+                    else:
+                        client_md5 = None
 
                     # FLUSH ANY REMAINING BUFFERED PACKETS
                     while expected_seq in buffer:
@@ -43,9 +65,18 @@ def run_server(port, output_file):
 
                     break
 
-                # UNPACK SEQUENCE NUMBER AND PAYLOAD
+                # UNPACK SEQUENCE NUMBER, CHECKSUM, AND PAYLOAD
                 seq_num = struct.unpack('!I', data[:4])[0]
-                payload = data[4:]
+                recv_checksum = struct.unpack('!H', data[4:6])[0]
+                payload = data[6:]
+
+                # VERIFY PER-PACKET CHECKSUM
+                calc_checksum = compute_checksum(payload)
+                if recv_checksum == calc_checksum:
+                    checksum_pass += 1
+                else:
+                    checksum_fail += 1
+                    print(f"[!] CHECKSUM MISMATCH ON SEQ({seq_num})! RECV({recv_checksum:#06x}) CALC({calc_checksum:#06x})")
 
                 # OPEN FILE ON FIRST PACKET
                 if f is None:
@@ -74,8 +105,28 @@ def run_server(port, output_file):
                     buffer[seq_num] = payload
                 # seq_num < expected_seq: DUPLICATE, IGNORE
 
+            # PRINT PER-PACKET CHECKSUM SUMMARY
+            total_packets = checksum_pass + checksum_fail
+            print(f"[*] PACKET CHECKSUM SUMMARY: {checksum_pass}/{total_packets} PASSED, {checksum_fail}/{total_packets} FAILED")
+
             if f:
                 f.close()
+
+            # UDP FINAL CHECK: COMPUTE MD5 OF RECEIVED FILE AND COMPARE WITH CLIENT
+            if sender_filename and os.path.exists(sender_filename):
+                server_md5 = hashlib.md5(open(sender_filename, 'rb').read()).hexdigest()
+
+                if client_md5:
+                    print(f"[*] UDP FINAL CHECK - CLIENT MD5[{client_md5}]")
+                    print(f"[*] UDP FINAL CHECK - SERVER MD5[{server_md5}]")
+                    if client_md5 == server_md5:
+                        print("[*] UDP FINAL CHECK - MATCH! FILE INTEGRITY VERIFIED!")
+                    else:
+                        print("[!] UDP FINAL CHECK - MISMATCH! FILE MAY BE CORRUPTED!")
+                else:
+                    print(f"[*] UDP FINAL CHECK - SERVER MD5[{server_md5}]")
+                    print("[!] UDP FINAL CHECK - NO CLIENT CHECKSUM RECEIVED FOR COMPARISON")
+
             print("==== END OF RECEPTION ====")
 
     except KeyboardInterrupt:
